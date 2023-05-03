@@ -7,7 +7,7 @@ use std::{
 use crate::{
     innerlude::{Mutation, Mutations, SuspenseContext},
     nodes::RenderReturn,
-    ScopeId, TaskId, VNode, VirtualDom,
+    ScopeId, TaskId, VNode, VirtualDom, subtree::Subtree,
 };
 
 use super::SuspenseId;
@@ -44,9 +44,12 @@ impl VirtualDom {
             .consume_context::<Rc<SuspenseContext>>()
             .unwrap()
     }
+}
 
+impl Subtree {
     pub(crate) fn handle_suspense_wakeup(&mut self, id: SuspenseId) {
-        let leaves = self.scheduler.leaves.borrow_mut();
+        let dom = self.dom.borrow();
+        let leaves = dom.scheduler.leaves.borrow_mut();
         let leaf = leaves.get(id.0).unwrap();
 
         let scope_id = leaf.scope_id;
@@ -62,10 +65,10 @@ impl VirtualDom {
         // we should attach them to that component and then render its children
         // continue rendering the tree until we hit yet another suspended component
         if let Poll::Ready(new_nodes) = as_pinned_mut.poll_unpin(&mut cx) {
-            let fiber = self.acquire_suspense_boundary(leaf.scope_id);
+            let fiber = self.get_dom().acquire_suspense_boundary(leaf.scope_id);
 
-            let scope = &self.scopes[scope_id];
-            let arena = scope.current_frame();
+            let dom = self.get_dom();
+            let arena = dom.scopes[scope_id].current_frame();
 
             let ret = arena.bump().alloc(match new_nodes {
                 Some(new) => RenderReturn::Ready(new),
@@ -73,6 +76,8 @@ impl VirtualDom {
             });
 
             arena.node.set(ret);
+
+            drop(arena);
 
             fiber.waiting_on.borrow_mut().remove(&id);
 
@@ -82,28 +87,29 @@ impl VirtualDom {
                 let template: &VNode = unsafe { std::mem::transmute(template) };
                 let mutations: &mut Mutations = unsafe { std::mem::transmute(mutations) };
 
-                std::mem::swap(&mut self.mutations, mutations);
+                std::mem::swap(&mut self.get_dom().mutations, mutations);
 
-                let place_holder_id = scope.placeholder.get().unwrap();
-                self.scope_stack.push(scope_id);
+                let place_holder_id = self.get_dom().scopes[scope_id].placeholder.get().unwrap();
+                self.get_dom().scope_stack.push(scope_id);
 
                 drop(leaves);
+                drop(dom);
 
                 let created = self.create(template);
-                self.scope_stack.pop();
+                self.get_dom().scope_stack.pop();
                 mutations.push(Mutation::ReplaceWith {
                     id: place_holder_id,
                     m: created,
                 });
 
-                for leaf in self.collected_leaves.drain(..) {
+                for leaf in self.get_dom().collected_leaves.drain(..) {
                     fiber.waiting_on.borrow_mut().insert(leaf);
                 }
 
-                std::mem::swap(&mut self.mutations, mutations);
+                std::mem::swap(&mut self.get_dom().mutations, mutations);
 
                 if fiber.waiting_on.borrow().is_empty() {
-                    self.finished_fibers.push(fiber.id);
+                    self.get_dom().finished_fibers.push(fiber.id);
                 }
             }
         }

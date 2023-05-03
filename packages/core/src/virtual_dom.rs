@@ -11,12 +11,12 @@ use crate::{
     nodes::{Template, TemplateId},
     scheduler::SuspenseId,
     scopes::{ScopeId, ScopeState},
-    AttributeValue, Element, Event, Scope, SuspenseContext,
+    AttributeValue, Element, Event, Scope, SuspenseContext, subtree::{Subtree, SubtreeId},
 };
 use futures_util::{pin_mut, StreamExt};
 use rustc_hash::FxHashMap;
 use slab::Slab;
-use std::{any::Any, borrow::BorrowMut, cell::Cell, collections::BTreeSet, future::Future, rc::Rc};
+use std::{any::Any, borrow::BorrowMut, cell::{Cell, RefCell}, collections::BTreeSet, future::Future, rc::Rc};
 
 /// A virtual node system that progresses user events and diffs UI trees.
 ///
@@ -182,7 +182,7 @@ pub struct VirtualDom {
     pub(crate) scheduler: Rc<Scheduler>,
 
     // Every element is actually a dual reference - one to the template and the other to the dynamic node in that template
-    pub(crate) elements: Slab<ElementRef>,
+    pub(crate) subtrees: Slab<Subtree>,
 
     // While diffing we need some sort of way of breaking off a stream of suspended mutations.
     pub(crate) scope_stack: Vec<ScopeId>,
@@ -218,7 +218,7 @@ impl VirtualDom {
     /// ```
     ///
     /// Note: the VirtualDom is not progressed, you must either "run_with_deadline" or use "rebuild" to progress it.
-    pub fn new(app: fn(Scope) -> Element) -> Self {
+    pub fn new(app: fn(Scope) -> Element) -> Rc<RefCell<Self>> {
         Self::new_with_props(app, ())
     }
 
@@ -252,24 +252,27 @@ impl VirtualDom {
     /// let mut dom = VirtualDom::new_with_props(Example, SomeProps { name: "jane" });
     /// let mutations = dom.rebuild();
     /// ```
-    pub fn new_with_props<P: 'static>(root: fn(Scope<P>) -> Element, root_props: P) -> Self {
+    pub fn new_with_props<P: 'static>(root: fn(Scope<P>) -> Element, root_props: P) -> Rc<RefCell<Self>> {
         let (tx, rx) = futures_channel::mpsc::unbounded();
-        let mut dom = Self {
+        let mut dom = Rc::new(RefCell::new(Self {
             rx,
             scheduler: Scheduler::new(tx),
             templates: Default::default(),
             scopes: Default::default(),
-            elements: Default::default(),
+            subtrees: Default::default(),
             scope_stack: Vec::new(),
             dirty_scopes: BTreeSet::new(),
             collected_leaves: Vec::new(),
             finished_fibers: Vec::new(),
             mutations: Mutations::default(),
-        };
+        }));
 
-        let root = dom.new_scope(
+
+        let mut binding = (*dom).borrow_mut();
+        let root = binding.new_scope(
             Box::new(VProps::new(root, |_, _| unreachable!(), root_props)),
             "app",
+            dom.clone()
         );
 
         // The root component is always a suspense boundary for any async children
@@ -281,9 +284,11 @@ impl VirtualDom {
         // Unlike react, we provide a default error boundary that just renders the error as a string
         root.provide_context(Rc::new(ErrorBoundary::new(ScopeId(0))));
 
-        // the root element is always given element ID 0 since it's the container for the entire tree
-        dom.elements.insert(ElementRef::none());
+        // the root subtree is always given element ID 0 since it's the container for the entire tree
+        binding.subtrees.insert(Subtree::none(dom.clone()));
 
+        drop(binding);
+        
         dom
     }
 
@@ -338,100 +343,6 @@ impl VirtualDom {
         !self.scheduler.leaves.borrow().is_empty()
     }
 
-    /// Call a listener inside the VirtualDom with data from outside the VirtualDom.
-    ///
-    /// This method will identify the appropriate element. The data must match up with the listener delcared. Note that
-    /// this method does not give any indication as to the success of the listener call. If the listener is not found,
-    /// nothing will happen.
-    ///
-    /// It is up to the listeners themselves to mark nodes as dirty.
-    ///
-    /// If you have multiple events, you can call this method multiple times before calling "render_with_deadline"
-    pub fn handle_event(
-        &mut self,
-        name: &str,
-        data: Rc<dyn Any>,
-        element: ElementId,
-        bubbles: bool,
-    ) {
-        /*
-        ------------------------
-        The algorithm works by walking through the list of dynamic attributes, checking their paths, and breaking when
-        we find the target path.
-
-        With the target path, we try and move up to the parent until there is no parent.
-        Due to how bubbling works, we call the listeners before walking to the parent.
-
-        If we wanted to do capturing, then we would accumulate all the listeners and call them in reverse order.
-        ----------------------
-
-        For a visual demonstration, here we present a tree on the left and whether or not a listener is collected on the
-        right.
-
-        |           <-- yes (is ascendant)
-        | | |       <-- no  (is not direct ascendant)
-        | |         <-- yes (is ascendant)
-        | | | | |   <--- target element, break early, don't check other listeners
-        | | |       <-- no, broke early
-        |           <-- no, broke early
-        */
-        let mut parent_path = self.elements.get(element.0);
-        let mut listeners = vec![];
-
-        // We will clone this later. The data itself is wrapped in RC to be used in callbacks if required
-        let uievent = Event {
-            propagates: Rc::new(Cell::new(bubbles)),
-            data,
-        };
-
-        // Loop through each dynamic attribute in this template before moving up to the template's parent.
-        while let Some(el_ref) = parent_path {
-            // safety: we maintain references of all vnodes in the element slab
-            let template = unsafe { el_ref.template.unwrap().as_ref() };
-            let node_template = template.template.get();
-            let target_path = el_ref.path;
-
-            for (idx, attr) in template.dynamic_attrs.iter().enumerate() {
-                let this_path = node_template.attr_paths[idx];
-
-                // Remove the "on" prefix if it exists, TODO, we should remove this and settle on one
-                if attr.name.trim_start_matches("on") == name
-                    && target_path.is_decendant(&this_path)
-                {
-                    listeners.push(&attr.value);
-
-                    // Break if the event doesn't bubble anyways
-                    if !bubbles {
-                        break;
-                    }
-
-                    // Break if this is the exact target element.
-                    // This means we won't call two listeners with the same name on the same element. This should be
-                    // documented, or be rejected from the rsx! macro outright
-                    if target_path == this_path {
-                        break;
-                    }
-                }
-            }
-
-            // Now that we've accumulated all the parent attributes for the target element, call them in reverse order
-            // We check the bubble state between each call to see if the event has been stopped from bubbling
-            for listener in listeners.drain(..).rev() {
-                if let AttributeValue::Listener(listener) = listener {
-                    if let Some(cb) = listener.borrow_mut().as_deref_mut() {
-                        cb(uievent.clone());
-                    }
-
-                    if !uievent.propagates.get() {
-                        return;
-                    }
-                }
-            }
-
-            parent_path = template.parent.and_then(|id| self.elements.get(id.0));
-        }
-    }
-
     /// Wait for the scheduler to have any work.
     ///
     /// This method polls the internal future queue, waiting for suspense nodes, tasks, or other work. This completes when
@@ -457,7 +368,7 @@ impl VirtualDom {
                 Some(msg) => match msg {
                     SchedulerMsg::Immediate(id) => self.mark_dirty(id),
                     SchedulerMsg::TaskNotified(task) => self.handle_task_wakeup(task),
-                    SchedulerMsg::SuspenseNotified(id) => self.handle_suspense_wakeup(id),
+                    SchedulerMsg::SuspenseNotified(id) => self.subtrees[0].handle_suspense_wakeup(id),
                 },
 
                 // If they're not ready, then we should wait for them to be ready
@@ -485,7 +396,7 @@ impl VirtualDom {
             match msg {
                 SchedulerMsg::Immediate(id) => self.mark_dirty(id),
                 SchedulerMsg::TaskNotified(task) => self.handle_task_wakeup(task),
-                SchedulerMsg::SuspenseNotified(id) => self.handle_suspense_wakeup(id),
+                SchedulerMsg::SuspenseNotified(id) => self.subtrees[0].handle_suspense_wakeup(id),
             }
         }
     }
@@ -538,7 +449,7 @@ impl VirtualDom {
         match unsafe { self.run_scope(ScopeId(0)).extend_lifetime_ref() } {
             // Rebuilding implies we append the created elements to the root
             RenderReturn::Ready(node) => {
-                let m = self.create_scope(ScopeId(0), node);
+                let m = self.subtrees[0].create_scope(ScopeId(0), node);
                 self.mutations.edits.push(Mutation::AppendChildren {
                     id: ElementId(0),
                     m,
@@ -554,13 +465,13 @@ impl VirtualDom {
 
     /// Render whatever the VirtualDom has ready as fast as possible without requiring an executor to progress
     /// suspended subtrees.
-    pub fn render_immediate(&mut self) -> Mutations {
+    pub fn render_immediate(&mut self, subtree_id: SubtreeId) -> Mutations {
         // Build a waker that won't wake up since our deadline is already expired when it's polled
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
 
         // Now run render with deadline but dont even try to poll any async tasks
-        let fut = self.render_with_deadline(std::future::ready(()));
+        let fut = self.render_with_deadline(std::future::ready(()), subtree_id);
         pin_mut!(fut);
 
         // The root component is not allowed to be async
@@ -575,7 +486,7 @@ impl VirtualDom {
     /// It's generally a good idea to put some sort of limit on the suspense process in case a future is having issues.
     ///
     /// If no suspense trees are present
-    pub async fn render_with_deadline(&mut self, deadline: impl Future<Output = ()>) -> Mutations {
+    pub async fn render_with_deadline(&mut self, deadline: impl Future<Output = ()>, subtree_id: SubtreeId) -> Mutations {
         pin_mut!(deadline);
 
         self.process_events();
@@ -621,7 +532,7 @@ impl VirtualDom {
 
                 // Run the scope and get the mutations
                 self.run_scope(dirty.id);
-                self.diff_scope(dirty.id);
+                self.subtrees[subtree_id.0].diff_scope(dirty.id);
 
                 // If suspended leaves are present, then we should find the boundary for this scope and attach things
                 // No placeholder necessary since this is a diff

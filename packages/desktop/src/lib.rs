@@ -1,7 +1,7 @@
 #![doc = include_str!("readme.md")]
 #![doc(html_logo_url = "https://avatars.githubusercontent.com/u/79236386")]
 #![doc(html_favicon_url = "https://avatars.githubusercontent.com/u/79236386")]
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 mod cfg;
 mod desktop_context;
@@ -10,6 +10,7 @@ mod eval;
 mod events;
 mod protocol;
 mod shortcut;
+pub mod subtrees;
 mod waker;
 mod webview;
 
@@ -24,7 +25,8 @@ pub use eval::{use_eval, EvalResult};
 use futures_util::{pin_mut, FutureExt};
 use shortcut::ShortcutRegistry;
 pub use shortcut::{use_global_shortcut, ShortcutHandle, ShortcutId, ShortcutRegistryError};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::{collections::HashMap, cell::RefMut};
 use std::rc::Rc;
 use std::task::Waker;
 pub use tao::dpi::{LogicalSize, PhysicalSize};
@@ -56,8 +58,8 @@ use wry::{application::window::WindowId, webview::WebContext};
 ///     })
 /// }
 /// ```
-pub fn launch(root: Component) {
-    launch_with_props(root, (), Config::default())
+pub fn launch(dom: &mut VirtualDom, subtree_id: SubtreeId) {
+    launch_with_props(dom, (), Config::default(), subtree_id)
 }
 
 /// Launch the WebView and run the event loop, with configuration.
@@ -79,8 +81,8 @@ pub fn launch(root: Component) {
 ///     })
 /// }
 /// ```
-pub fn launch_cfg(root: Component, config_builder: Config) {
-    launch_with_props(root, (), config_builder)
+pub fn launch_cfg(dom: &mut VirtualDom, config_builder: Config, subtree_id: SubtreeId) {
+    launch_with_props(dom, (), config_builder, subtree_id)
 }
 
 /// Launch the WebView and run the event loop, with configuration and root props.
@@ -106,7 +108,7 @@ pub fn launch_cfg(root: Component, config_builder: Config) {
 ///     })
 /// }
 /// ```
-pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) {
+pub fn launch_with_props<P: 'static>(dom: &mut VirtualDom, props: P, cfg: Config, subtree_id: SubtreeId) {
     let event_loop = EventLoop::<UserWindowEvent>::with_user_event();
 
     let proxy = event_loop.create_proxy();
@@ -149,10 +151,11 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
         cfg,
         &event_loop,
         &proxy,
-        VirtualDom::new_with_props(root, props),
+        dom,
         &queue,
         &event_handlers,
         shortcut_manager.clone(),
+        subtree_id
     ));
 
     event_loop.run(move |window_event, event_loop, control_flow| {
@@ -227,10 +230,10 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
 
                     let view = webviews.get_mut(&event.1).unwrap();
 
-                    view.dom
+                    view.dom.get_subtree(subtree_id)
                         .handle_event(&evt.name, evt.data.into_any(), evt.element, evt.bubbles);
 
-                    send_edits(view.dom.render_immediate(), &view.webview);
+                    send_edits(view.dom.render_immediate(view.subtree_id), &view.webview);
                 }
 
                 EventData::Ipc(msg) if msg.method() == "initialize" => {
@@ -272,15 +275,16 @@ pub fn launch_with_props<P: 'static>(root: Component<P>, props: P, cfg: Config) 
     })
 }
 
-fn create_new_window(
+fn create_new_window<'a>(
     mut cfg: Config,
-    event_loop: &EventLoopWindowTarget<UserWindowEvent>,
-    proxy: &EventLoopProxy<UserWindowEvent>,
-    dom: VirtualDom,
-    queue: &WebviewQueue,
-    event_handlers: &WindowEventHandlers,
+    event_loop: &'a EventLoopWindowTarget<UserWindowEvent>,
+    proxy: &'a EventLoopProxy<UserWindowEvent>,
+    dom: &'a mut VirtualDom,
+    queue: &'a WebviewQueue,
+    event_handlers: &'a WindowEventHandlers,
     shortcut_manager: ShortcutRegistry,
-) -> WebviewHandler {
+    subtree_id: SubtreeId
+) -> WebviewHandler<'a> {
     let (webview, web_context) = webview::build(&mut cfg, event_loop, proxy.clone());
 
     dom.base_scope().provide_context(DesktopContext::new(
@@ -298,13 +302,15 @@ fn create_new_window(
     WebviewHandler {
         webview,
         dom,
+        subtree_id,
         waker: waker::tao_waker(proxy, id),
         web_context,
     }
 }
 
-struct WebviewHandler {
-    dom: VirtualDom,
+struct WebviewHandler<'a> {
+    dom: &'a mut VirtualDom,
+    subtree_id: SubtreeId,
     webview: Rc<wry::webview::WebView>,
     waker: Waker,
     // This is nessisary because of a bug in wry. Wry assumes the webcontext is alive for the lifetime of the webview. We need to keep the webcontext alive, otherwise the webview will crash
@@ -322,7 +328,7 @@ fn poll_vdom(view: &mut WebviewHandler) {
 
     loop {
         {
-            let fut = view.dom.wait_for_work();
+            let fut = view.dom.wait_for_work(view.subtree_id);
             pin_mut!(fut);
 
             match fut.poll_unpin(&mut cx) {
@@ -331,7 +337,7 @@ fn poll_vdom(view: &mut WebviewHandler) {
             }
         }
 
-        send_edits(view.dom.render_immediate(), &view.webview);
+        send_edits(view.dom.render_immediate(view.subtree_id), &view.webview);
     }
 }
 
@@ -340,5 +346,6 @@ fn send_edits(edits: Mutations, webview: &WebView) {
     let serialized = serde_json::to_string(&edits).unwrap();
 
     // todo: use SSE and binary data to send the edits with lower overhead
+    println!("{:?}", &edits);
     _ = webview.evaluate_script(&format!("window.interpreter.handleEdits({serialized})"));
 }

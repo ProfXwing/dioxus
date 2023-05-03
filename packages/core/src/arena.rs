@@ -2,7 +2,7 @@ use std::ptr::NonNull;
 
 use crate::{
     innerlude::DirtyScope, nodes::RenderReturn, nodes::VNode, virtual_dom::VirtualDom,
-    AttributeValue, DynamicNode, ScopeId,
+    AttributeValue, DynamicNode, ScopeId, subtree::Subtree,
 };
 use bumpalo::boxed::Box as BumpBox;
 
@@ -37,7 +37,7 @@ impl ElementRef {
     }
 }
 
-impl VirtualDom {
+impl Subtree {
     pub(crate) fn next_element(&mut self, template: &VNode, path: &'static [u8]) -> ElementId {
         self.next_reference(template, ElementPath::Deep(path))
     }
@@ -86,6 +86,10 @@ impl VirtualDom {
         let node: *const VNode = node as *const _;
         self.elements[el.0].template = unsafe { std::mem::transmute(node) };
     }
+}
+
+impl VirtualDom {
+    
 
     // Drop a scope and all its children
     //

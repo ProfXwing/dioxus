@@ -17,6 +17,7 @@ mod properties;
 mod scheduler;
 mod scope_arena;
 mod scopes;
+mod subtree;
 mod virtual_dom;
 
 pub(crate) mod innerlude {

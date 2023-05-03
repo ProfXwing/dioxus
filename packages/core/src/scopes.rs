@@ -7,7 +7,7 @@ use crate::{
     innerlude::{ErrorBoundary, Scheduler, SchedulerMsg},
     lazynodes::LazyNodes,
     nodes::{ComponentReturn, IntoAttributeValue, IntoDynNode, RenderReturn},
-    AnyValue, Attribute, AttributeValue, Element, Event, Properties, TaskId,
+    AnyValue, Attribute, AttributeValue, Element, Event, Properties, TaskId, VirtualDom,
 };
 use bumpalo::{boxed::Box as BumpBox, Bump};
 use bumpslab::{BumpSlab, Slot};
@@ -184,6 +184,8 @@ pub struct ScopeState {
 
     pub(crate) props: Option<Box<dyn AnyProps<'static>>>,
     pub(crate) placeholder: Cell<Option<ElementId>>,
+
+    pub(crate) dom: Rc<RefCell<VirtualDom>>,
 }
 
 impl<'src> ScopeState {

@@ -13,6 +13,8 @@ use crate::shortcut::ShortcutRegistryError;
 use crate::Config;
 use crate::WebviewHandler;
 use dioxus_core::ScopeState;
+use dioxus_core::Subtree;
+use dioxus_core::SubtreeId;
 use dioxus_core::VirtualDom;
 #[cfg(all(feature = "hot-reload", debug_assertions))]
 use dioxus_hot_reload::HotReloadMsg;
@@ -37,7 +39,7 @@ pub fn use_window(cx: &ScopeState) -> &DesktopContext {
         .unwrap()
 }
 
-pub(crate) type WebviewQueue = Rc<RefCell<Vec<WebviewHandler>>>;
+pub(crate) type WebviewQueue<'a> = Rc<RefCell<Vec<WebviewHandler<'a>>>>;
 
 /// An imperative interface to the current window.
 ///
@@ -52,7 +54,7 @@ pub(crate) type WebviewQueue = Rc<RefCell<Vec<WebviewHandler>>>;
 ///     let desktop = cx.consume_context::<DesktopContext>().unwrap();
 /// ```
 #[derive(Clone)]
-pub struct DesktopContext {
+pub struct DesktopContext<'a> {
     /// The wry/tao proxy to the current window
     pub webview: Rc<WebView>,
 
@@ -62,7 +64,7 @@ pub struct DesktopContext {
     /// The receiver for eval results since eval is async
     pub(super) eval: tokio::sync::broadcast::Sender<Value>,
 
-    pub(super) pending_windows: WebviewQueue,
+    pub(super) pending_windows: WebviewQueue<'a>,
 
     pub(crate) event_loop: EventLoopWindowTarget<UserWindowEvent>,
 
@@ -75,7 +77,7 @@ pub struct DesktopContext {
 }
 
 /// A smart pointer to the current window.
-impl std::ops::Deref for DesktopContext {
+impl std::ops::Deref for DesktopContext<'_> {
     type Target = Window;
 
     fn deref(&self) -> &Self::Target {
@@ -83,7 +85,7 @@ impl std::ops::Deref for DesktopContext {
     }
 }
 
-impl DesktopContext {
+impl DesktopContext<'_> {
     pub(crate) fn new(
         webview: Rc<WebView>,
         proxy: ProxyType,
@@ -112,7 +114,7 @@ impl DesktopContext {
     /// You can use this to control other windows from the current window.
     ///
     /// Be careful to not create a cycle of windows, or you might leak memory.
-    pub fn new_window(&self, dom: VirtualDom, cfg: Config) -> Weak<WebView> {
+    pub fn new_window(&self, dom: &mut VirtualDom, cfg: Config, subtree_id: SubtreeId) -> Weak<WebView> {
         let window = create_new_window(
             cfg,
             &self.event_loop,
@@ -121,6 +123,7 @@ impl DesktopContext {
             &self.pending_windows,
             &self.event_handlers,
             self.shortcut_manager.clone(),
+            subtree_id
         );
 
         let id = window.webview.window().id();

@@ -6,18 +6,134 @@ use crate::{
     nodes::RenderReturn,
     nodes::{DynamicNode, VNode},
     scopes::ScopeId,
-    virtual_dom::VirtualDom,
-    Attribute, AttributeValue, TemplateNode,
+    Attribute, AttributeValue, TemplateNode, subtree::Subtree, VirtualDom,
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use DynamicNode::*;
 
 impl<'b> VirtualDom {
-    pub(super) fn diff_scope(&mut self, scope: ScopeId) {
-        let scope_state = &mut self.scopes[scope];
+    fn diff_ok_to_async(&mut self, _new: &'b VNode<'b>, _scope: ScopeId) {
+        //
+    }
 
-        self.scope_stack.push(scope);
+    fn update_attribute(&mut self, right_attr: &'b Attribute<'b>, left_attr: &'b Attribute) {
+        let name = unsafe { std::mem::transmute(left_attr.name) };
+        let value: BorrowedAttributeValue<'b> = (&right_attr.value).into();
+        let value = unsafe { std::mem::transmute(value) };
+        self.mutations.push(Mutation::SetAttribute {
+            id: left_attr.mounted_element.get(),
+            ns: right_attr.namespace,
+            name,
+            value,
+        });
+    }
+
+    /// Push all the real nodes on the stack
+    fn push_all_real_nodes(&mut self, node: &'b VNode<'b>) -> usize {
+        node.template
+            .get()
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let node = match node.dynamic_root(idx) {
+                    Some(node) => node,
+                    None => {
+                        self.mutations.push(Mutation::PushRoot {
+                            id: node.root_ids.get(idx).unwrap(),
+                        });
+                        return 1;
+                    }
+                };
+
+                match node {
+                    Text(t) => {
+                        self.mutations.push(Mutation::PushRoot {
+                            id: t.id.get().unwrap(),
+                        });
+                        1
+                    }
+                    Placeholder(t) => {
+                        self.mutations.push(Mutation::PushRoot {
+                            id: t.id.get().unwrap(),
+                        });
+                        1
+                    }
+                    Fragment(nodes) => nodes
+                        .iter()
+                        .map(|node| self.push_all_real_nodes(node))
+                        .sum(),
+
+                    Component(comp) => {
+                        let scope = comp.scope.get().unwrap();
+                        match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
+                            RenderReturn::Ready(node) => self.push_all_real_nodes(node),
+                            RenderReturn::Aborted(_node) => todo!(),
+                            _ => todo!(),
+                        }
+                    }
+                }
+            })
+            .sum()
+    }
+
+    fn find_first_element(&self, node: &'b VNode<'b>) -> ElementId {
+        match node.dynamic_root(0) {
+            None => node.root_ids.get(0).unwrap(),
+            Some(Text(t)) => t.id.get().unwrap(),
+            Some(Fragment(t)) => self.find_first_element(&t[0]),
+            Some(Placeholder(t)) => t.id.get().unwrap(),
+            Some(Component(comp)) => {
+                let scope = comp.scope.get().unwrap();
+                match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
+                    RenderReturn::Ready(t) => self.find_first_element(t),
+                    _ => todo!("cannot handle nonstandard nodes"),
+                }
+            }
+        }
+    }
+
+    fn find_last_element(&self, node: &'b VNode<'b>) -> ElementId {
+        match node.dynamic_root(node.template.get().roots.len() - 1) {
+            None => node.root_ids.last().unwrap(),
+            Some(Text(t)) => t.id.get().unwrap(),
+            Some(Fragment(t)) => self.find_last_element(t.last().unwrap()),
+            Some(Placeholder(t)) => t.id.get().unwrap(),
+            Some(Component(comp)) => {
+                let scope = comp.scope.get().unwrap();
+                match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
+                    RenderReturn::Ready(t) => self.find_last_element(t),
+                    _ => todo!("cannot handle nonstandard nodes"),
+                }
+            }
+        }
+    }
+}
+
+impl<'b> Subtree {
+    fn create_children(&mut self, nodes: impl IntoIterator<Item = &'b VNode<'b>>) -> usize {
+        nodes
+            .into_iter()
+            .fold(0, |acc, child| acc + self.create(child))
+    }
+
+    fn create_and_insert_before(&mut self, new: &'b [VNode<'b>], before: &'b VNode<'b>) {
+        let m = self.create_children(new);
+        let id = self.get_dom().find_first_element(before);
+        self.get_dom().mutations.push(Mutation::InsertBefore { id, m })
+    }
+
+    fn create_and_insert_after(&mut self, new: &'b [VNode<'b>], after: &'b VNode<'b>) {
+        let m = self.create_children(new);
+        let id = self.get_dom().find_last_element(after);
+        self.get_dom().mutations.push(Mutation::InsertAfter { id, m })
+    }
+
+    pub(super) fn diff_scope(&mut self, scope: ScopeId) {
+        let scope_state = &mut self.dom.borrow_mut().scopes[scope];
+
+        self.get_dom().scope_stack.push(scope);
         unsafe {
             // Load the old and new bump arenas
             let old = scope_state
@@ -43,7 +159,7 @@ impl<'b> VirtualDom {
                 (Aborted(l), Aborted(r)) => r.id.set(l.id.get()),
 
                 // Becomes async, do nothing while we wait
-                (Ready(_nodes), Pending(_fut)) => self.diff_ok_to_async(_nodes, scope),
+                (Ready(_nodes), Pending(_fut)) => self.get_dom().diff_ok_to_async(_nodes, scope),
 
                 // Placeholder becomes something
                 // We should also clear the error now
@@ -58,31 +174,27 @@ impl<'b> VirtualDom {
                 }
             };
         }
-        self.scope_stack.pop();
-    }
-
-    fn diff_ok_to_async(&mut self, _new: &'b VNode<'b>, _scope: ScopeId) {
-        //
+        self.get_dom().scope_stack.pop();
     }
 
     fn diff_ok_to_err(&mut self, l: &'b VNode<'b>, p: &'b VPlaceholder) {
         let id = self.next_null();
         p.id.set(Some(id));
-        self.mutations.push(Mutation::CreatePlaceholder { id });
+        self.get_dom().mutations.push(Mutation::CreatePlaceholder { id });
 
-        let pre_edits = self.mutations.edits.len();
+        let pre_edits = self.get_dom().mutations.edits.len();
 
         self.remove_node(l, true);
 
         // We should always have a remove mutation
         // Eventually we don't want to generate placeholders, so this might not be true. But it's true today
-        assert!(self.mutations.edits.len() > pre_edits);
+        assert!(self.get_dom().mutations.edits.len() > pre_edits);
 
         // We want to optimize the replace case to use one less mutation if possible
         // Since mutations are done in reverse, the last node removed will be the first in the stack
         // Instead of *just* removing it, we can use the replace mutation
-        match self.mutations.edits.pop().unwrap() {
-            Mutation::Remove { id } => self.mutations.push(Mutation::ReplaceWith { id, m: 1 }),
+        match self.get_dom().mutations.edits.pop().unwrap() {
+            Mutation::Remove { id } => self.get_dom().mutations.push(Mutation::ReplaceWith { id, m: 1 }),
             _ => panic!("Expected remove mutation from remove_node"),
         };
     }
@@ -92,7 +204,7 @@ impl<'b> VirtualDom {
         #[cfg(debug_assertions)]
         {
             let (path, byte_index) = right_template.template.get().name.rsplit_once(':').unwrap();
-            if let Some(map) = self.templates.get(path) {
+            if let Some(map) = self.get_dom().templates.get(path) {
                 let byte_index = byte_index.parse::<usize>().unwrap();
                 if let Some(&template) = map.get(&byte_index) {
                     right_template.template.set(template);
@@ -132,7 +244,7 @@ impl<'b> VirtualDom {
 
                 // If the attributes are different (or volatile), we need to update them
                 if left_attr.value != right_attr.value || left_attr.volatile {
-                    self.update_attribute(right_attr, left_attr);
+                    self.get_dom().update_attribute(right_attr, left_attr);
                 }
             });
 
@@ -156,7 +268,7 @@ impl<'b> VirtualDom {
             }
         }
     }
-
+    
     fn diff_dynamic_node(
         &mut self,
         left_node: &'b DynamicNode<'b>,
@@ -174,19 +286,7 @@ impl<'b> VirtualDom {
             _ => todo!("This is an usual custom case for dynamic nodes. We don't know how to handle it yet."),
         };
     }
-
-    fn update_attribute(&mut self, right_attr: &'b Attribute<'b>, left_attr: &'b Attribute) {
-        let name = unsafe { std::mem::transmute(left_attr.name) };
-        let value: BorrowedAttributeValue<'b> = (&right_attr.value).into();
-        let value = unsafe { std::mem::transmute(value) };
-        self.mutations.push(Mutation::SetAttribute {
-            id: left_attr.mounted_element.get(),
-            ns: right_attr.namespace,
-            name,
-            value,
-        });
-    }
-
+    
     fn diff_vcomponent(
         &mut self,
         left: &'b VComponent<'b>,
@@ -209,7 +309,7 @@ impl<'b> VirtualDom {
         right.scope.set(Some(scope_id));
 
         // copy out the box for both
-        let old = self.scopes[scope_id].props.as_ref();
+        let old = self.get_dom().scopes[scope_id].props.as_ref();
         let new: Box<dyn AnyProps> = right.props.take().unwrap();
         let new: Box<dyn AnyProps> = unsafe { std::mem::transmute(new) };
 
@@ -221,14 +321,14 @@ impl<'b> VirtualDom {
         }
 
         // First, move over the props from the old to the new, dropping old props in the process
-        self.scopes[scope_id].props = Some(new);
+        self.get_dom().scopes[scope_id].props = Some(new);
 
         // Now run the component and diff it
-        self.run_scope(scope_id);
+        self.get_dom().run_scope(scope_id);
         self.diff_scope(scope_id);
 
-        self.dirty_scopes.remove(&DirtyScope {
-            height: self.scopes[scope_id].height,
+        self.get_dom().dirty_scopes.remove(&DirtyScope {
+            height: self.get_dom().scopes[scope_id].height,
             id: scope_id,
         });
     }
@@ -242,17 +342,17 @@ impl<'b> VirtualDom {
     ) {
         let m = self.create_component_node(right_template, right, idx);
 
-        let pre_edits = self.mutations.edits.len();
+        let pre_edits = self.get_dom().mutations.edits.len();
 
         self.remove_component_node(left, true);
 
-        assert!(self.mutations.edits.len() > pre_edits);
+        assert!(self.get_dom().mutations.edits.len() > pre_edits);
 
         // We want to optimize the replace case to use one less mutation if possible
         // Since mutations are done in reverse, the last node removed will be the first in the stack
         // Instead of *just* removing it, we can use the replace mutation
-        match self.mutations.edits.pop().unwrap() {
-            Mutation::Remove { id } => self.mutations.push(Mutation::ReplaceWith { id, m }),
+        match self.get_dom().mutations.edits.pop().unwrap() {
+            Mutation::Remove { id } => self.get_dom().mutations.push(Mutation::ReplaceWith { id, m }),
             at => panic!("Expected remove mutation from remove_node {:#?}", at),
         };
     }
@@ -317,7 +417,7 @@ impl<'b> VirtualDom {
         right.id.set(Some(id));
         if left.value != right.value {
             let value = unsafe { std::mem::transmute(right.value) };
-            self.mutations.push(Mutation::SetText { id, value });
+            self.get_dom().mutations.push(Mutation::SetText { id, value });
         }
     }
 
@@ -370,16 +470,16 @@ impl<'b> VirtualDom {
     //
     // With keyed children, we care about whether we delete, move, or create nodes
     // versus mutate existing nodes in place. Presumably there is some sort of CSS
-    // transition animation that makes the virtual DOM diffing algorithm
-    // observable. By specifying keys for nodes, we know which virtual DOM nodes
-    // must reuse (or not reuse) the same physical DOM nodes.
+    // transition animation that makes the virtual self.get_dom() diffing algorithm
+    // observable. By specifying keys for nodes, we know which virtual self.get_dom() nodes
+    // must reuse (or not reuse) the same physical self.get_dom() nodes.
     //
     // This is loosely based on Inferno's keyed patching implementation. However, we
     // have to modify the algorithm since we are compiling the diff down into change
     // list instructions that will be executed later, rather than applying the
-    // changes to the DOM directly as we compare virtual DOMs.
+    // changes to the self.get_dom() directly as we compare virtual self.get_dom()s.
     //
-    // https://github.com/infernojs/inferno/blob/36fd96/packages/inferno/src/DOM/patching.ts#L530-L739
+    // https://github.com/infernojs/inferno/blob/36fd96/packages/inferno/src/self.get_dom()/patching.ts#L530-L739
     //
     // The stack is empty upon entry.
     fn diff_keyed_children(&mut self, old: &'b [VNode<'b>], new: &'b [VNode<'b>]) {
@@ -505,7 +605,7 @@ impl<'b> VirtualDom {
     // We find the longest subsequence within `old` of children that are relatively
     // ordered the same way in `new` (via finding a longest-increasing-subsequence
     // of the old child's index within `new`). The children that are elements of
-    // this subsequence will remain in place, minimizing the number of DOM moves we
+    // this subsequence will remain in place, minimizing the number of self.get_dom() moves we
     // will have to do.
     //
     // Upon entry to this function, the change list stack must be empty.
@@ -630,13 +730,13 @@ impl<'b> VirtualDom {
                     nodes_created += self.create(new_node);
                 } else {
                     self.diff_node(&old[old_index], new_node);
-                    nodes_created += self.push_all_real_nodes(new_node);
+                    nodes_created += self.get_dom().push_all_real_nodes(new_node);
                 }
             }
 
-            let id = self.find_last_element(&new[last]);
+            let id = self.get_dom().find_last_element(&new[last]);
             if nodes_created > 0 {
-                self.mutations.push(Mutation::InsertAfter {
+                self.get_dom().mutations.push(Mutation::InsertAfter {
                     id,
                     m: nodes_created,
                 })
@@ -656,13 +756,13 @@ impl<'b> VirtualDom {
                         nodes_created += self.create(new_node);
                     } else {
                         self.diff_node(&old[old_index], new_node);
-                        nodes_created += self.push_all_real_nodes(new_node);
+                        nodes_created += self.get_dom().push_all_real_nodes(new_node);
                     }
                 }
 
-                let id = self.find_first_element(&new[last]);
+                let id = self.get_dom().find_first_element(&new[last]);
                 if nodes_created > 0 {
-                    self.mutations.push(Mutation::InsertBefore {
+                    self.get_dom().mutations.push(Mutation::InsertBefore {
                         id,
                         m: nodes_created,
                     });
@@ -682,85 +782,18 @@ impl<'b> VirtualDom {
                     nodes_created += self.create(new_node);
                 } else {
                     self.diff_node(&old[old_index], new_node);
-                    nodes_created += self.push_all_real_nodes(new_node);
+                    nodes_created += self.get_dom().push_all_real_nodes(new_node);
                 }
             }
 
-            let id = self.find_first_element(&new[first_lis]);
+            let id = self.get_dom().find_first_element(&new[first_lis]);
             if nodes_created > 0 {
-                self.mutations.push(Mutation::InsertBefore {
+                self.get_dom().mutations.push(Mutation::InsertBefore {
                     id,
                     m: nodes_created,
                 });
             }
         }
-    }
-
-    /// Push all the real nodes on the stack
-    fn push_all_real_nodes(&mut self, node: &'b VNode<'b>) -> usize {
-        node.template
-            .get()
-            .roots
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                let node = match node.dynamic_root(idx) {
-                    Some(node) => node,
-                    None => {
-                        self.mutations.push(Mutation::PushRoot {
-                            id: node.root_ids.get(idx).unwrap(),
-                        });
-                        return 1;
-                    }
-                };
-
-                match node {
-                    Text(t) => {
-                        self.mutations.push(Mutation::PushRoot {
-                            id: t.id.get().unwrap(),
-                        });
-                        1
-                    }
-                    Placeholder(t) => {
-                        self.mutations.push(Mutation::PushRoot {
-                            id: t.id.get().unwrap(),
-                        });
-                        1
-                    }
-                    Fragment(nodes) => nodes
-                        .iter()
-                        .map(|node| self.push_all_real_nodes(node))
-                        .sum(),
-
-                    Component(comp) => {
-                        let scope = comp.scope.get().unwrap();
-                        match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
-                            RenderReturn::Ready(node) => self.push_all_real_nodes(node),
-                            RenderReturn::Aborted(_node) => todo!(),
-                            _ => todo!(),
-                        }
-                    }
-                }
-            })
-            .sum()
-    }
-
-    fn create_children(&mut self, nodes: impl IntoIterator<Item = &'b VNode<'b>>) -> usize {
-        nodes
-            .into_iter()
-            .fold(0, |acc, child| acc + self.create(child))
-    }
-
-    fn create_and_insert_before(&mut self, new: &'b [VNode<'b>], before: &'b VNode<'b>) {
-        let m = self.create_children(new);
-        let id = self.find_first_element(before);
-        self.mutations.push(Mutation::InsertBefore { id, m })
-    }
-
-    fn create_and_insert_after(&mut self, new: &'b [VNode<'b>], after: &'b VNode<'b>) {
-        let m = self.create_children(new);
-        let id = self.find_last_element(after);
-        self.mutations.push(Mutation::InsertAfter { id, m })
     }
 
     /// Simply replace a placeholder with a list of nodes
@@ -771,26 +804,26 @@ impl<'b> VirtualDom {
     ) {
         let m = self.create_children(r);
         let id = l.id.get().unwrap();
-        self.mutations.push(Mutation::ReplaceWith { id, m });
+        self.get_dom().mutations.push(Mutation::ReplaceWith { id, m });
         self.reclaim(id);
     }
 
     fn replace(&mut self, left: &'b VNode<'b>, right: impl IntoIterator<Item = &'b VNode<'b>>) {
         let m = self.create_children(right);
 
-        let pre_edits = self.mutations.edits.len();
+        let pre_edits = self.get_dom().mutations.edits.len();
 
         self.remove_node(left, true);
 
         // We should always have a remove mutation
         // Eventually we don't want to generate placeholders, so this might not be true. But it's true today
-        assert!(self.mutations.edits.len() > pre_edits);
+        assert!(self.get_dom().mutations.edits.len() > pre_edits);
 
         // We want to optimize the replace case to use one less mutation if possible
         // Since mutations are done in reverse, the last node removed will be the first in the stack
         // Instead of *just* removing it, we can use the replace mutation
-        match self.mutations.edits.pop().unwrap() {
-            Mutation::Remove { id } => self.mutations.push(Mutation::ReplaceWith { id, m }),
+        match self.get_dom().mutations.edits.pop().unwrap() {
+            Mutation::Remove { id } => self.get_dom().mutations.push(Mutation::ReplaceWith { id, m }),
             _ => panic!("Expected remove mutation from remove_node"),
         };
     }
@@ -801,7 +834,7 @@ impl<'b> VirtualDom {
 
         r.id.set(Some(placeholder));
 
-        self.mutations
+        self.get_dom().mutations
             .push(Mutation::CreatePlaceholder { id: placeholder });
 
         self.remove_nodes(l);
@@ -809,13 +842,13 @@ impl<'b> VirtualDom {
         // We want to optimize the replace case to use one less mutation if possible
         // Since mutations are done in reverse, the last node removed will be the first in the stack
         // Instead of *just* removing it, we can use the replace mutation
-        match self.mutations.edits.pop().unwrap() {
-            Mutation::Remove { id } => self.mutations.push(Mutation::ReplaceWith { id, m: 1 }),
+        match self.get_dom().mutations.edits.pop().unwrap() {
+            Mutation::Remove { id } => self.get_dom().mutations.push(Mutation::ReplaceWith { id, m: 1 }),
             _ => panic!("Expected remove mutation from remove_node"),
         };
     }
 
-    /// Remove these nodes from the dom
+    /// Remove these nodes from the self.get_dom()
     /// Wont generate mutations for the inner nodes
     fn remove_nodes(&mut self, nodes: &'b [VNode<'b>]) {
         nodes
@@ -846,7 +879,7 @@ impl<'b> VirtualDom {
             } else {
                 let id = node.root_ids.get(idx).unwrap();
                 if gen_muts {
-                    self.mutations.push(Mutation::Remove { id });
+                    self.get_dom().mutations.push(Mutation::Remove { id });
                 }
                 self.reclaim(id);
             }
@@ -910,24 +943,6 @@ impl<'b> VirtualDom {
         };
     }
 
-    fn remove_placeholder(&mut self, t: &VPlaceholder, gen_muts: bool) {
-        if let Some(id) = t.id.take() {
-            if gen_muts {
-                self.mutations.push(Mutation::Remove { id });
-            }
-            self.reclaim(id)
-        }
-    }
-
-    fn remove_text_node(&mut self, t: &VText, gen_muts: bool) {
-        if let Some(id) = t.id.take() {
-            if gen_muts {
-                self.mutations.push(Mutation::Remove { id });
-            }
-            self.reclaim(id)
-        }
-    }
-
     fn remove_component_node(&mut self, comp: &VComponent, gen_muts: bool) {
         // Remove the component reference from the vcomponent so they're not tied together
         let scope = comp
@@ -935,50 +950,36 @@ impl<'b> VirtualDom {
             .take()
             .expect("VComponents to always have a scope");
 
-        // Remove the component from the dom
-        match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
+        // Remove the component from the self.get_dom()
+        match unsafe { self.get_dom().scopes[scope].root_node().extend_lifetime_ref() } {
             RenderReturn::Ready(t) => self.remove_node(t, gen_muts),
             RenderReturn::Aborted(placeholder) => self.remove_placeholder(placeholder, gen_muts),
             _ => todo!(),
         };
 
         // Restore the props back to the vcomponent in case it gets rendered again
-        let props = self.scopes[scope].props.take();
+        let props = self.get_dom().scopes[scope].props.take();
         *comp.props.borrow_mut() = unsafe { std::mem::transmute(props) };
 
         // Now drop all the resouces
-        self.drop_scope(scope, false);
+        self.get_dom().drop_scope(scope, false);
     }
 
-    fn find_first_element(&self, node: &'b VNode<'b>) -> ElementId {
-        match node.dynamic_root(0) {
-            None => node.root_ids.get(0).unwrap(),
-            Some(Text(t)) => t.id.get().unwrap(),
-            Some(Fragment(t)) => self.find_first_element(&t[0]),
-            Some(Placeholder(t)) => t.id.get().unwrap(),
-            Some(Component(comp)) => {
-                let scope = comp.scope.get().unwrap();
-                match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
-                    RenderReturn::Ready(t) => self.find_first_element(t),
-                    _ => todo!("cannot handle nonstandard nodes"),
-                }
+    fn remove_placeholder(&mut self, t: &VPlaceholder, gen_muts: bool) {
+        if let Some(id) = t.id.take() {
+            if gen_muts {
+                self.get_dom().mutations.push(Mutation::Remove { id });
             }
+            self.reclaim(id)
         }
     }
-
-    fn find_last_element(&self, node: &'b VNode<'b>) -> ElementId {
-        match node.dynamic_root(node.template.get().roots.len() - 1) {
-            None => node.root_ids.last().unwrap(),
-            Some(Text(t)) => t.id.get().unwrap(),
-            Some(Fragment(t)) => self.find_last_element(t.last().unwrap()),
-            Some(Placeholder(t)) => t.id.get().unwrap(),
-            Some(Component(comp)) => {
-                let scope = comp.scope.get().unwrap();
-                match unsafe { self.scopes[scope].root_node().extend_lifetime_ref() } {
-                    RenderReturn::Ready(t) => self.find_last_element(t),
-                    _ => todo!("cannot handle nonstandard nodes"),
-                }
+    
+    fn remove_text_node(&mut self, t: &VText, gen_muts: bool) {
+        if let Some(id) = t.id.take() {
+            if gen_muts {
+                self.get_dom().mutations.push(Mutation::Remove { id });
             }
+            self.reclaim(id)
         }
     }
 }

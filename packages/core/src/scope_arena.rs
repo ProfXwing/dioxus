@@ -12,7 +12,7 @@ use std::{
     mem,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll}, rc::Rc, cell::RefCell,
 };
 
 impl VirtualDom {
@@ -20,6 +20,7 @@ impl VirtualDom {
         &mut self,
         props: Box<dyn AnyProps<'static>>,
         name: &'static str,
+        dom: Rc<RefCell<VirtualDom>>
     ) -> &ScopeState {
         let parent = self.acquire_current_scope_raw();
         let entry = self.scopes.vacant_entry();
@@ -44,6 +45,7 @@ impl VirtualDom {
             shared_contexts: Default::default(),
             borrowed_props: Default::default(),
             attributes_to_drop: Default::default(),
+            dom
         })
     }
 
