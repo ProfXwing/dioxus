@@ -13,6 +13,7 @@ use std::{rc::{Rc}, cell::{Cell, RefCell, RefMut}, any::Any};
 use slab::Slab;
 use crate::{innerlude::{ElementRef}, ElementId, Event, AttributeValue, ScopeId, Scope, ScopeState, VirtualDom};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubtreeId(pub usize);
 
 /// A collection of elements confined to a single scope under a chunk of the tree
@@ -24,8 +25,7 @@ pub struct SubtreeId(pub usize);
 pub struct Subtree {
     pub id: usize,
     // namespace: Cow<'static, str>,
-    pub root: ScopeId,
-    pub elements: Slab<ElementRef>,
+    pub(crate) elements: Slab<ElementRef>,
     pub dom: Rc<RefCell<VirtualDom>>
 }
 
@@ -33,7 +33,14 @@ impl Subtree {
     pub fn none(dom: Rc<RefCell<VirtualDom>>) -> Self {
         Self {
             id: 0,
-            root: ScopeId(0),
+            elements: Slab::new(),
+            dom
+        }
+    }
+
+    pub fn new(id: SubtreeId, dom: Rc<RefCell<VirtualDom>>) -> Self {
+        Self {
+            id: id.0,
             elements: Slab::new(),
             dom
         }

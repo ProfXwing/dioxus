@@ -10,9 +10,9 @@ mod eval;
 mod events;
 mod protocol;
 mod shortcut;
-pub mod subtrees;
 mod waker;
 mod webview;
+pub mod subtrees;
 
 pub use cfg::Config;
 pub use desktop_context::{
@@ -25,8 +25,7 @@ pub use eval::{use_eval, EvalResult};
 use futures_util::{pin_mut, FutureExt};
 use shortcut::ShortcutRegistry;
 pub use shortcut::{use_global_shortcut, ShortcutHandle, ShortcutId, ShortcutRegistryError};
-use std::cell::RefCell;
-use std::{collections::HashMap, cell::RefMut};
+use std::{collections::HashMap, cell::RefCell};
 use std::rc::Rc;
 use std::task::Waker;
 pub use tao::dpi::{LogicalSize, PhysicalSize};
@@ -58,7 +57,7 @@ use wry::{application::window::WindowId, webview::WebContext};
 ///     })
 /// }
 /// ```
-pub fn launch(dom: &mut VirtualDom, subtree_id: SubtreeId) {
+pub fn launch(dom: Rc<RefCell<VirtualDom>>, subtree_id: SubtreeId) {
     launch_with_props(dom, (), Config::default(), subtree_id)
 }
 
@@ -81,8 +80,8 @@ pub fn launch(dom: &mut VirtualDom, subtree_id: SubtreeId) {
 ///     })
 /// }
 /// ```
-pub fn launch_cfg(dom: &mut VirtualDom, config_builder: Config, subtree_id: SubtreeId) {
-    launch_with_props(dom, (), config_builder, subtree_id)
+pub fn launch_cfg(root: Rc<RefCell<VirtualDom>>, config_builder: Config, subtree_id: SubtreeId) {
+    launch_with_props(root, (), config_builder, subtree_id)
 }
 
 /// Launch the WebView and run the event loop, with configuration and root props.
@@ -108,7 +107,7 @@ pub fn launch_cfg(dom: &mut VirtualDom, config_builder: Config, subtree_id: Subt
 ///     })
 /// }
 /// ```
-pub fn launch_with_props<P: 'static>(dom: &mut VirtualDom, props: P, cfg: Config, subtree_id: SubtreeId) {
+pub fn launch_with_props<P: 'static>(dom: Rc<RefCell<VirtualDom>>, props: P, cfg: Config, subtree_id: SubtreeId) {
     let event_loop = EventLoop::<UserWindowEvent>::with_user_event();
 
     let proxy = event_loop.create_proxy();
@@ -198,9 +197,9 @@ pub fn launch_with_props<P: 'static>(dom: &mut VirtualDom, props: P, cfg: Config
                 EventData::HotReloadEvent(msg) => match msg {
                     dioxus_hot_reload::HotReloadMsg::UpdateTemplate(template) => {
                         for webview in webviews.values_mut() {
-                            webview.dom.replace_template(template);
+                            webview.dom.borrow_mut().replace_template(template);
 
-                            poll_vdom(webview);
+                            poll_vdom(webview, );
                         }
                     }
                     dioxus_hot_reload::HotReloadMsg::Shutdown => {
@@ -229,16 +228,15 @@ pub fn launch_with_props<P: 'static>(dom: &mut VirtualDom, props: P, cfg: Config
                     };
 
                     let view = webviews.get_mut(&event.1).unwrap();
+                    let mut dom = view.dom.borrow_mut();
+                    dom.get_subtree_mut(view.subtree_id).unwrap().handle_event(&evt.name, evt.data.into_any(), evt.element, evt.bubbles);
 
-                    view.dom.get_subtree(subtree_id)
-                        .handle_event(&evt.name, evt.data.into_any(), evt.element, evt.bubbles);
-
-                    send_edits(view.dom.render_immediate(view.subtree_id), &view.webview);
+                    send_edits(dom.render_immediate(view.subtree_id), &view.webview);
                 }
 
                 EventData::Ipc(msg) if msg.method() == "initialize" => {
                     let view = webviews.get_mut(&event.1).unwrap();
-                    send_edits(view.dom.rebuild(), &view.webview);
+                    send_edits(view.dom.borrow_mut().rebuild(), &view.webview);
                 }
 
                 // When the webview chirps back with the result of the eval, we send it to the active receiver
@@ -247,7 +245,7 @@ pub fn launch_with_props<P: 'static>(dom: &mut VirtualDom, props: P, cfg: Config
                 // you might the wrong result. This should be fixed
                 EventData::Ipc(msg) if msg.method() == "eval_result" => {
                     webviews[&event.1]
-                        .dom
+                        .dom.borrow_mut()
                         .base_scope()
                         .consume_context::<DesktopContext>()
                         .unwrap()
@@ -275,19 +273,19 @@ pub fn launch_with_props<P: 'static>(dom: &mut VirtualDom, props: P, cfg: Config
     })
 }
 
-fn create_new_window<'a>(
+fn create_new_window(
     mut cfg: Config,
-    event_loop: &'a EventLoopWindowTarget<UserWindowEvent>,
-    proxy: &'a EventLoopProxy<UserWindowEvent>,
-    dom: &'a mut VirtualDom,
-    queue: &'a WebviewQueue,
-    event_handlers: &'a WindowEventHandlers,
+    event_loop: &EventLoopWindowTarget<UserWindowEvent>,
+    proxy: &EventLoopProxy<UserWindowEvent>,
+    dom: Rc<RefCell<VirtualDom>>,
+    queue: &WebviewQueue,
+    event_handlers: &WindowEventHandlers,
     shortcut_manager: ShortcutRegistry,
     subtree_id: SubtreeId
-) -> WebviewHandler<'a> {
+) -> WebviewHandler {
     let (webview, web_context) = webview::build(&mut cfg, event_loop, proxy.clone());
 
-    dom.base_scope().provide_context(DesktopContext::new(
+    dom.borrow_mut().base_scope().provide_context(DesktopContext::new(
         webview.clone(),
         proxy.clone(),
         event_loop.clone(),
@@ -302,14 +300,14 @@ fn create_new_window<'a>(
     WebviewHandler {
         webview,
         dom,
-        subtree_id,
         waker: waker::tao_waker(proxy, id),
         web_context,
+        subtree_id,
     }
 }
 
-struct WebviewHandler<'a> {
-    dom: &'a mut VirtualDom,
+struct WebviewHandler {
+    dom: Rc<RefCell<VirtualDom>>,
     subtree_id: SubtreeId,
     webview: Rc<wry::webview::WebView>,
     waker: Waker,
@@ -326,9 +324,10 @@ struct WebviewHandler<'a> {
 fn poll_vdom(view: &mut WebviewHandler) {
     let mut cx = std::task::Context::from_waker(&view.waker);
 
+    let mut dom = view.dom.borrow_mut();
     loop {
         {
-            let fut = view.dom.wait_for_work(view.subtree_id);
+            let fut = dom.wait_for_work();
             pin_mut!(fut);
 
             match fut.poll_unpin(&mut cx) {
@@ -337,7 +336,7 @@ fn poll_vdom(view: &mut WebviewHandler) {
             }
         }
 
-        send_edits(view.dom.render_immediate(view.subtree_id), &view.webview);
+        send_edits(dom.render_immediate(view.subtree_id), &view.webview);
     }
 }
 
@@ -346,6 +345,5 @@ fn send_edits(edits: Mutations, webview: &WebView) {
     let serialized = serde_json::to_string(&edits).unwrap();
 
     // todo: use SSE and binary data to send the edits with lower overhead
-    println!("{:?}", &edits);
     _ = webview.evaluate_script(&format!("window.interpreter.handleEdits({serialized})"));
 }

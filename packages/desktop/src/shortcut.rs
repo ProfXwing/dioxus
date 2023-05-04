@@ -145,8 +145,8 @@ pub struct ShortcutId {
 }
 
 /// A global shortcut. This will be automatically removed when it is dropped.
-pub struct ShortcutHandle<'a> {
-    desktop: DesktopContext<'a>,
+pub struct ShortcutHandle {
+    desktop: DesktopContext,
     /// The id of the shortcut
     pub shortcut_id: ShortcutId,
 }
@@ -175,14 +175,14 @@ pub fn use_global_shortcut(
     })
 }
 
-impl ShortcutHandle<'_> {
+impl ShortcutHandle {
     /// Remove the shortcut.
     pub fn remove(&self) {
         self.desktop.remove_shortcut(self.shortcut_id);
     }
 }
 
-impl Drop for ShortcutHandle<'_> {
+impl Drop for ShortcutHandle {
     fn drop(&mut self) {
         self.remove()
     }

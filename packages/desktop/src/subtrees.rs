@@ -1,16 +1,17 @@
 #![allow(non_snake_case)]
-use std::{rc::Weak, cell::RefCell};
-
 use dioxus::prelude::*;
-use dioxus_core::{Element, Scope, SubtreeId, Subtree};
+use dioxus_core::{Element, Scope, Subtree};
 
 #[inline_props]
-pub fn WindowRenderer<'a>(cx: Scope<'a>, dom: &'a mut VirtualDom, children: Element<'a>) -> Element {
-    let subtree_id = dom.generate_subtree();
+pub fn WindowRenderer<'a>(cx: Scope<'a>, children: Element<'a>) -> Element {
+    println!("WindowRenderer");
+    let dom = cx.dom.clone();
+    let subtree_id = dom.borrow_mut().generate_subtree();
 
     // if let Some(webview) = cx.consume_context::<Webview>() {
     // } else {
-    crate::launch(*dom, subtree_id);
+    // }
+    crate::launch(dom, subtree_id);
     // }
 
     cx.render(rsx!(children))
@@ -18,8 +19,5 @@ pub fn WindowRenderer<'a>(cx: Scope<'a>, dom: &'a mut VirtualDom, children: Elem
 
 pub fn launch(component: Component) {
     let mut dom = VirtualDom::new(component);
-}
-
-pub fn create_webview(subtree: &Subtree, dom: &VirtualDom) {
-
+    dom.borrow_mut().get_subtree(SubtreeId(0)).unwrap();
 }

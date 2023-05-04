@@ -34,6 +34,7 @@ pub(crate) mod innerlude {
     pub use crate::scheduler::*;
     pub use crate::scopes::*;
     pub use crate::virtual_dom::*;
+    pub use crate::subtree::*;
 
     /// An [`Element`] is a possibly-none [`VNode`] created by calling `render` on [`Scope`] or [`ScopeState`].
     ///
@@ -72,7 +73,7 @@ pub(crate) mod innerlude {
 
 pub use crate::innerlude::{
     fc_to_builder, AnyValue, Attribute, AttributeValue, BorrowedAttributeValue, CapturedError,
-    Component, DynamicNode, Element, ElementId, Event, Fragment, IntoDynNode, LazyNodes, Mutation,
+    Component, DynamicNode, Element, ElementId, Subtree, SubtreeId, Event, Fragment, IntoDynNode, LazyNodes, Mutation,
     Mutations, Properties, RenderReturn, Scope, ScopeId, ScopeState, Scoped, SuspenseContext,
     TaskId, Template, TemplateAttribute, TemplateNode, VComponent, VNode, VPlaceholder, VText,
     VirtualDom,
@@ -84,7 +85,7 @@ pub use crate::innerlude::{
 pub mod prelude {
     pub use crate::innerlude::{
         fc_to_builder, AnyValue, Component, Element, Event, EventHandler, Fragment,
-        IntoAttributeValue, LazyNodes, Properties, Scope, ScopeId, ScopeState, Scoped, TaskId,
+        IntoAttributeValue, LazyNodes, Properties, Scope, ScopeId, Subtree, SubtreeId, ScopeState, Scoped, TaskId,
         Template, TemplateAttribute, TemplateNode, Throw, VNode, VirtualDom,
     };
 }

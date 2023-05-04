@@ -588,6 +588,22 @@ impl VirtualDom {
     fn finalize(&mut self) -> Mutations {
         std::mem::take(&mut self.mutations)
     }
+
+    pub fn generate_subtree(&mut self) -> SubtreeId {
+        let entry = self.subtrees.vacant_entry();
+        let id = SubtreeId(entry.key());
+
+        entry.insert(Subtree::new(id, self.scopes.get(ScopeId(0)).unwrap().dom.clone()));
+        id
+    }
+
+    pub fn get_subtree(&self, id: SubtreeId) -> Option<&Subtree> {
+        self.subtrees.get(id.0)
+    }
+    
+    pub fn get_subtree_mut(&mut self, id: SubtreeId) -> Option<&mut Subtree> {
+        self.subtrees.get_mut(id.0)
+    }
 }
 
 impl Drop for VirtualDom {

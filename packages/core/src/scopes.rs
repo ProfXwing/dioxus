@@ -185,7 +185,7 @@ pub struct ScopeState {
     pub(crate) props: Option<Box<dyn AnyProps<'static>>>,
     pub(crate) placeholder: Cell<Option<ElementId>>,
 
-    pub(crate) dom: Rc<RefCell<VirtualDom>>,
+    pub dom: Rc<RefCell<VirtualDom>>,
 }
 
 impl<'src> ScopeState {

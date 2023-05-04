@@ -131,7 +131,8 @@ impl<'b> Subtree {
     }
 
     pub(super) fn diff_scope(&mut self, scope: ScopeId) {
-        let scope_state = &mut self.dom.borrow_mut().scopes[scope];
+        let mut dom = self.dom.borrow_mut();
+        let scope_state = &dom.scopes[scope];
 
         self.get_dom().scope_stack.push(scope);
         unsafe {
@@ -146,6 +147,7 @@ impl<'b> Subtree {
                 .try_load_node()
                 .expect("Call rebuild before diffing");
 
+            drop(dom);
             use RenderReturn::{Aborted, Pending, Ready};
 
             match (old, new) {
@@ -204,9 +206,12 @@ impl<'b> Subtree {
         #[cfg(debug_assertions)]
         {
             let (path, byte_index) = right_template.template.get().name.rsplit_once(':').unwrap();
-            if let Some(map) = self.get_dom().templates.get(path) {
+            let dom = self.get_dom();
+            let map = dom.templates.get(path);
+            if let Some(map) = map {
                 let byte_index = byte_index.parse::<usize>().unwrap();
                 if let Some(&template) = map.get(&byte_index) {
+                    drop(dom);
                     right_template.template.set(template);
                     if template != left_template.template.get() {
                         return self.replace(left_template, [right_template]);
@@ -309,7 +314,8 @@ impl<'b> Subtree {
         right.scope.set(Some(scope_id));
 
         // copy out the box for both
-        let old = self.get_dom().scopes[scope_id].props.as_ref();
+        let dom = self.get_dom();
+        let old = dom.scopes[scope_id].props.as_ref();
         let new: Box<dyn AnyProps> = right.props.take().unwrap();
         let new: Box<dyn AnyProps> = unsafe { std::mem::transmute(new) };
 
@@ -325,6 +331,7 @@ impl<'b> Subtree {
 
         // Now run the component and diff it
         self.get_dom().run_scope(scope_id);
+        drop(dom);
         self.diff_scope(scope_id);
 
         self.get_dom().dirty_scopes.remove(&DirtyScope {
@@ -951,7 +958,10 @@ impl<'b> Subtree {
             .expect("VComponents to always have a scope");
 
         // Remove the component from the self.get_dom()
-        match unsafe { self.get_dom().scopes[scope].root_node().extend_lifetime_ref() } {
+        let dom = self.get_dom();
+        let render_return = unsafe {dom.scopes[scope].root_node().extend_lifetime_ref()};
+        drop(dom);
+        match render_return {
             RenderReturn::Ready(t) => self.remove_node(t, gen_muts),
             RenderReturn::Aborted(placeholder) => self.remove_placeholder(placeholder, gen_muts),
             _ => todo!(),

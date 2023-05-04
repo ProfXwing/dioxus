@@ -48,8 +48,8 @@ impl VirtualDom {
 
 impl Subtree {
     pub(crate) fn handle_suspense_wakeup(&mut self, id: SuspenseId) {
-        let dom = self.dom.borrow();
-        let leaves = dom.scheduler.leaves.borrow_mut();
+        let dom2 = self.dom.borrow();
+        let leaves = dom2.scheduler.leaves.borrow_mut();
         let leaf = leaves.get(id.0).unwrap();
 
         let scope_id = leaf.scope_id;
@@ -93,6 +93,7 @@ impl Subtree {
                 self.get_dom().scope_stack.push(scope_id);
 
                 drop(leaves);
+                drop(dom2);
                 drop(dom);
 
                 let created = self.create(template);
